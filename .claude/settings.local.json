@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -aB25 '\"ext-intl\"' composer.lock)"
+    ]
+  }
+}
