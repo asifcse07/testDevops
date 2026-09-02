@@ -1,0 +1,260 @@
+---
+# ============================================================
+#  Laravel deploy playbook
+#  ------------------------------------------------------------
+#  এক কমান্ডে: সার্ভার সাজায় → কোড আনে → সাইট live করে
+#  চালানো:  ansible-playbook -i inventory.ini deploy.yml
+#  শুধু দেখা: ansible-playbook -i inventory.ini deploy.yml --check
+# ============================================================
+
+- name: Setup and deploy Laravel app
+
+  # কোন সার্ভারে চলবে — inventory.ini-র [web] গ্রুপ
+  hosts: web
+
+  # প্রতিটা task root হিসেবে চলবে (Ansible নিজেই sudo লাগিয়ে নেয়)।
+  # EC2-তে ubuntu ইউজার দিয়ে ঢুকলেও এই এক লাইনেই root-এর কাজ হয়ে যায়।
+  become: true
+
+  # ------------------------------------------------------------
+  # পরিবর্তনশীল সব কিছু এখানে — বদলাতে হলে শুধু এই ব্লকটাই ছোঁবে
+  # ------------------------------------------------------------
+  vars:
+    app_dir: /var/www/laravel_app                          # সার্ভারে কোড কোথায় বসবে
+    repo_url: https://github.com/asifcse07/testDevops.git  # তোমার GitHub repo
+    git_branch: master                                     # master না main? ls-remote দিয়ে দেখো
+    php_version: "8.5"                                     # সার্ভারে `ls /run/php/` যা দেখায়
+    add_php_ppa: false                                     # 24.04-এ 8.3 চাইলে true
+    db_name: laravel_app                                   # নিচের তিনটা templates/env.j2-এর
+    db_user: laravel                                       # মানগুলোর সাথে হুবহু মিলতে হবে,
+    db_pass: "StrongPass123!"                              # নইলে migrate-এ access denied
+
+  tasks:
+
+    # ========== ১. সার্ভার প্রস্তুত ==========
+
+    # apt-র প্যাকেজ তালিকা নতুন করে আনে। এটা না করলে নিচের
+    # install task-গুলো পুরোনো/খালি তালিকা দেখে "package not found" বলতে পারে।
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    # ওয়েব সার্ভার আর দরকারি টুল। state: present মানে
+    # আগে থেকে থাকলে হাত দেবে না — এটাই idempotency।
+    - name: Install nginx, git and unzip
+      apt:
+        name: [nginx, git, unzip, curl]
+        state: present
+
+    # ========== ২. PHP ==========
+
+    # শুধু তখনই চলে যখন উপরে add_php_ppa: true।
+    # Ubuntu 24.04-এ নির্দিষ্ট ভার্সন (8.3) লাগলে দরকার হয়।
+    # 26.04-এ এই PPA কাজ করে না — তাই ডিফল্ট false।
+    - name: Add Ondrej PHP repository
+      apt_repository:
+        repo: ppa:ondrej/php
+      when: add_php_ppa | bool
+
+    # php-fpm = nginx-এর হয়ে ওয়েব রিকোয়েস্টে PHP চালায়
+    # php-cli = terminal-এ php artisan চালানোর জন্য
+    # বাকিগুলো Laravel-এর দরকারি extension। ভার্সন নম্বরটা
+    # উপরের php_version থেকে বসে — এক জায়গায় বদলালেই সব বদলায়।
+    - name: Install PHP and extensions
+      apt:
+        name:
+          - "php{{ php_version }}-fpm"
+          - "php{{ php_version }}-cli"
+          - "php{{ php_version }}-mysql"
+          - "php{{ php_version }}-mbstring"
+          - "php{{ php_version }}-xml"
+          - "php{{ php_version }}-curl"
+          - "php{{ php_version }}-zip"
+          - "php{{ php_version }}-bcmath"
+          - "php{{ php_version }}-gd"
+        state: present
+
+    # ========== ৩. ডেটাবেস ==========
+
+    # এই তিনটে task না থাকলে migration-এ গিয়ে ভাঙে:
+    #   SQLSTATE[HY000] [2002] Connection refused
+    # কারণ 3306 পোর্টে তখন কেউ থাকে না।
+    - name: Install MySQL server
+      apt:
+        name: mysql-server
+        state: present
+
+    # শুধু বসানো যথেষ্ট না — চালু আছে কিনা নিশ্চিত করতে হয়।
+    # enabled: true মানে সার্ভার reboot হলেও নিজে থেকে চালু হবে।
+    - name: Ensure MySQL is running and enabled
+      service:
+        name: mysql
+        state: started
+        enabled: true
+
+    # Ubuntu-তে root MySQL-এ socket দিয়ে ঢোকে, তাই পাসওয়ার্ড লাগে না।
+    # IF NOT EXISTS ব্যবহার করায় বারবার চালালেও error দেয় না।
+    # ALTER USER রাখা হয়েছে যাতে vars-এ পাসওয়ার্ড বদলালে সেটাও আপডেট হয়।
+    # <<'SQL' -এর কোটেশন জরুরি — নইলে পাসওয়ার্ডের ! bash খেয়ে ফেলে।
+    - name: Create database and application user
+      shell: |
+        mysql <<'SQL'
+        CREATE DATABASE IF NOT EXISTS {{ db_name }}
+          CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+        CREATE USER IF NOT EXISTS '{{ db_user }}'@'localhost'
+          IDENTIFIED BY '{{ db_pass }}';
+        ALTER USER '{{ db_user }}'@'localhost'
+          IDENTIFIED BY '{{ db_pass }}';
+        GRANT ALL PRIVILEGES ON {{ db_name }}.* TO '{{ db_user }}'@'localhost';
+        FLUSH PRIVILEGES;
+        SQL
+
+    # ========== ৪. Composer ==========
+
+    # official installer স্ক্রিপ্টটা নামায় /tmp-এ।
+    - name: Download Composer installer
+      get_url:
+        url: https://getcomposer.org/installer
+        dest: /tmp/composer-setup.php
+
+    # স্ক্রিপ্টটা চালিয়ে composer-কে /usr/local/bin-এ বসায়।
+    # creates: — ওই ফাইল আগে থেকে থাকলে Ansible এই task চালাবেই না।
+    # shell module-এ idempotency এভাবেই আনতে হয়।
+    - name: Install Composer globally
+      shell: php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+      args:
+        creates: /usr/local/bin/composer
+
+    # ========== ৫. কোড আনা ==========
+
+    # git ২০২২ থেকে অন্যের মালিকানার repo-তে কাজ করতে অস্বীকার করে।
+    # নিচে "Set ownership to www-data" ফোল্ডারটা www-data-কে দিয়ে দেয়,
+    # তাই দ্বিতীয় রানে git (root হিসেবে) বলে "dubious ownership"।
+    # এই লাইনটা তার ব্যতিক্রম যোগ করে।
+    # grep -qx দিয়ে দেখা হয় আগে থেকে আছে কিনা — নইলে বারবার যোগ হতো।
+    - name: Allow git to work in the app directory
+      shell: |
+        git config --global --get-all safe.directory | grep -qx "{{ app_dir }}" \
+          || git config --global --add safe.directory "{{ app_dir }}"
+      changed_when: false
+
+    # repo না থাকলে clone করে, থাকলে টেনে আপডেট করে।
+    # force: true — সার্ভারে হাতে করা যেকোনো বদল মুছে যাবে।
+    #   (এটাই চাই: সার্ভার হবে git-এর হুবহু প্রতিচ্ছবি)
+    - name: Clone the application code
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ git_branch }}"
+        force: true
+
+    # ========== ৬. Laravel সেটআপ ==========
+
+    # ⚠ এই task অবশ্যই composer-এর আগে।
+    # কারণ composer install শেষে Laravel `php artisan package:discover`
+    # চালায়, আর .env না থাকলে সেটা আটকে যায় — task ঝুলে থাকে,
+    # কোনো error দেয় না। ক্রম বদলালেই এই ফাঁদ ফিরে আসবে।
+    - name: Copy .env from template
+      template:
+        src: templates/env.j2
+        dest: "{{ app_dir }}/.env"
+
+    # vendor/ ফোল্ডার বানায় (Laravel-এর সব dependency)।
+    #   --no-dev            = testing প্যাকেজ বাদ, production-এ দরকার নেই
+    #   --optimize-autoloader = autoload দ্রুত করে
+    #   --no-interaction    = প্রশ্ন করার বদলে error দিয়ে থামে
+    #                         (এটা না দিলে prompt-এ অনন্তকাল ঝুলে থাকে)
+    # COMPOSER_MEMORY_LIMIT: "-1" — PHP-র memory limit যেন composer-কে
+    #   মাঝপথে না মারে। ১ GB RAM-এ এটা ছাড়া প্রায়ই মারা যায়।
+    - name: Install PHP dependencies
+      shell: composer install --no-dev --optimize-autoloader --no-interaction
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: "1"
+        COMPOSER_MEMORY_LIMIT: "-1"
+
+    # env.j2-তে APP_KEY placeholder থাকে, তাই আসল key বানাতে হয়।
+    # না করলে সাইট খুললেই: "No application encryption key has been specified"
+    - name: Generate application key
+      shell: php artisan key:generate --force
+      args:
+        chdir: "{{ app_dir }}"
+
+    # ========== ৭. পারমিশন ==========
+
+    # nginx/php-fpm চলে www-data ইউজার হিসেবে, তাই ফাইলগুলো
+    # তার হতে হবে — নইলে সাইট পড়তেই পারবে না।
+    - name: Set ownership to www-data
+      file:
+        path: "{{ app_dir }}"
+        owner: www-data
+        group: www-data
+        recurse: true
+
+    # Laravel এই দুটো ফোল্ডারে লেখে (log, cache, session, compiled view)।
+    # লেখার অধিকার না থাকলে ৯০% ক্ষেত্রে "500 error / সাদা পেজ" আসে।
+    # loop দিয়ে একই কাজ দুটো path-এ চালানো হচ্ছে।
+    - name: Fix storage and cache permissions
+      file:
+        path: "{{ item }}"
+        mode: '0775'
+        recurse: true
+      loop:
+        - "{{ app_dir }}/storage"
+        - "{{ app_dir }}/bootstrap/cache"
+
+    # ========== ৮. ডেটাবেস ও cache ==========
+
+    # টেবিল বানায়। --force লাগে কারণ production-এ Laravel
+    # নিশ্চিত হতে চায় ("are you sure?") — automation-এ কেউ উত্তর দিতে পারে না।
+    - name: Run migrations
+      shell: php artisan migrate --force
+      args:
+        chdir: "{{ app_dir }}"
+
+    # config, route, view — সব cache করে সাইট দ্রুত করে।
+    # কোড বদলালে প্রতিবার আবার চালাতে হয়, তাই এটা playbook-এই থাকা ভালো।
+    - name: Cache config and routes
+      shell: php artisan optimize
+      args:
+        chdir: "{{ app_dir }}"
+
+    # ========== ৯. nginx ==========
+
+    # templates/nginx.conf.j2 থেকে config বানায়। ভেতরের
+    # {{ ansible_host }} আর {{ php_version }} চালানোর সময় বসে যায়।
+    # notify: — ফাইল বদলালে তবেই নিচের handler ডাকবে।
+    - name: Copy nginx site config
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/sites-available/laravel
+      notify: Reload nginx
+
+    # sites-available-এ config লেখা মানে সে চালু না; sites-enabled-এ
+    # symlink বানালে তবেই nginx সেটা পড়ে।
+    - name: Enable the site
+      file:
+        src: /etc/nginx/sites-available/laravel
+        dest: /etc/nginx/sites-enabled/laravel
+        state: link
+      notify: Reload nginx
+
+    # nginx-এর ডিফল্ট সাইট সরানো — না সরালে সে-ই port 80 দখল করে
+    # রাখে, আর ব্রাউজারে "Welcome to nginx" দেখায়, তোমার Laravel না।
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+  # ------------------------------------------------------------
+  # handler = এমন task যা শুধু notify পেলে চলে।
+  # তিনটে nginx task-ই এটাকে ডাকে, কিন্তু playbook-এর শেষে
+  # এটা মাত্র একবারই চলবে। config না বদলালে চলবেই না।
+  # ------------------------------------------------------------
+  handlers:
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded

@@ -1,0 +1,77 @@
+// ============================================================
+//  Laravel CI/CD pipeline
+//  ------------------------------------------------------------
+//  এই ফাইলটা Laravel repo-র root-এ থাকবে।
+//  Jenkins প্রতিটা build-এ repo clone করে এটা পড়ে।
+// ============================================================
+
+pipeline {
+
+    // কোন মেশিনে চলবে। 'any' = যেকোনো available executor,
+    // আমাদের ক্ষেত্রে Jenkins সার্ভার নিজেই।
+    agent any
+
+    stages {
+
+        // ---------- ১. কোড আনা ----------
+        // checkout scm = job-এ যে repo/branch সেট করা আছে সেটা clone করে
+        // workspace-এ (/var/lib/jenkins/workspace/<job-name>/)।
+        // এখানেই ansible/ ফোল্ডারটাও চলে আসে, কারণ সেটা একই repo-তে।
+        stage('Checkout') {
+            steps {
+                echo 'Getting the latest code...'
+                checkout scm
+            }
+        }
+
+        // ---------- ২. CI: কোড ঠিক আছে কিনা যাচাই ----------
+        // এই stage Jenkins সার্ভারে চলে, ওয়েব সার্ভারে না।
+        // তাই Jenkins সার্ভারে php-cli আর composer বসানো থাকতে হবে।
+        stage('Install & Test') {
+            steps {
+                // dev dependency দরকার — কারণ phpunit ওখানেই থাকে
+                sh 'composer install --no-interaction --prefer-dist'
+
+                // test চালাতে .env লাগে; example থেকে কপি করে key বানাই
+                sh 'cp .env.example .env'
+                sh 'php artisan key:generate'
+
+                // fail করলে pipeline এখানেই থামবে — Deploy আর চলবে না।
+                // এটাই CI-এর আসল কাজ: খারাপ কোড live-এ যেতে না দেওয়া।
+                sh 'php artisan test'
+            }
+        }
+
+        // ---------- ৩. CD: সার্ভারে পাঠানো ----------
+        stage('Deploy') {
+            steps {
+                echo 'Tests passed. Deploying via Ansible...'
+
+                // sshagent = Jenkins Credentials থেকে private key নিয়ে
+                // এই ব্লকের ভেতরের কমান্ডগুলোকে দেয়। 'ec2-ssh-key' হলো
+                // Credentials-এ তুমি যে ID দিয়েছ — হুবহু মিলতে হবে।
+                sshagent(credentials: ['ec2-ssh-key']) {
+                    sh '''
+                      # প্রথমবার ssh করলে host fingerprint নিয়ে প্রশ্ন করে,
+                      # আর automation-এ উত্তর দেওয়ার কেউ নেই — তাই বন্ধ।
+                      export ANSIBLE_HOST_KEY_CHECKING=False
+
+                      # path দুটো workspace-এর ভেতরের (repo-র ভেতরের)
+                      ansible-playbook \
+                        -i ansible/inventory.ini \
+                        ansible/deploy.yml
+                    '''
+                }
+            }
+        }
+    }
+
+    // ---------- সব stage শেষে ----------
+    // success/failure যাই হোক, post ব্লক সবসময় চলে।
+    // পরে এখানে Slack/email notification যোগ করতে পারো।
+    post {
+        success { echo 'Deploy successful!' }
+        failure { echo 'Something failed - not deployed.' }
+        always  { echo "Build #${env.BUILD_NUMBER} finished." }
+    }
+}

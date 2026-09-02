@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -aB25 '\"ext-intl\"' composer.lock)"
+      "Bash(grep -aB25 '\"ext-intl\"' composer.lock)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose up -d)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose ps)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose logs --no-color)",
+      "Bash(curl -s -o /tmp/resp.html -w \"HTTP %{http_code} | %{size_download} bytes | %{time_total}s\\\\n\" http://localhost:8000/)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose exec -T app sh -c \"ls -1 public/build/assets/ 2>&1; echo '---manifest---'; cat public/build/manifest.json 2>&1 | head -c 300\")"
     ]
   }
 }
